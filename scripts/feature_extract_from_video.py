@@ -1,213 +1,233 @@
-import glob
-import cv2
-from torchvision import transforms as pth_transforms
-from torch.utils.data import DataLoader, Dataset
-import numpy as np
-#import vision_transformer as vits
-#import utils
-import torch.nn as nn
+from torchvision import transforms
+from typing import Sequence
 from PIL import Image
+import hubconf
+import logging
+import colorlog
 from tqdm import tqdm
-import torch
-import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-import os
-from pathlib import Path
-from PIL import Image
 import cv2
-from torch.utils.data import Dataset
-import concurrent.futures
-import os
+import numpy as np
 from pathlib import Path
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import torch
+import os
+
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
+# Use timm's names for ImageNet default mean and standard deviation
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
-class VideoDataset(Dataset):
-    def __init__(self, directory, transform=None):
-        self.directory = directory
-        self.transform = transform
-        self.images = [os.path.join(directory, img) for img in os.listdir(directory) if img.endswith(('.png', '.jpg', '.jpeg'))]
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        image = Image.open(img_path).convert("RGB")
-        original_size = image.size
-        # Extract frame number from the filename assuming format 'frame_XXXX.jpg'
-        frame_number = int(os.path.basename(img_path).split('_')[-1].split('.')[0])
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, idx, img_path, original_size, frame_number
-
-def extract_frames_from_video(video_path, output_dir):
-    vidcap = cv2.VideoCapture(video_path)
-    success, image = vidcap.read()
-    count = 0
-    frames = []
-    while success:
-        frame_filename = os.path.join(output_dir, f"frame_{count:04d}.jpg")
-        frames.append((frame_filename, image))
-        success, image = vidcap.read()
-        count += 1
-        if len(frames) >= 100:
-            write_frames_to_disk(frames)
-            frames = []
-    if frames:
-        # remaining frames
-        write_frames_to_disk(frames)
-
-def write_frames_to_disk(frames):
-    for frame_filename, image in frames:
-        cv2.imwrite(frame_filename, image)
-
-def prepare_role_datasets_parallel(base_dir, role, output_base_dir):
-    session_dirs = list(Path(base_dir).glob(f"*/{role}.video.mp4"))
-
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for video_path in session_dirs:
-            session_id = video_path.parent.stem
-            output_dir_structure = {
-                "frames": os.path.join(output_base_dir, session_id, role, "frames"),
-                "features": os.path.join(output_base_dir, session_id, role, "extractions"),
-                "attention_maps": os.path.join(output_base_dir, session_id, role, "attention_maps")
-            }
-
-            for dir_path in output_dir_structure.values():
-                os.makedirs(dir_path, exist_ok=True)
-
-            futures.append(executor.submit(extract_frames_from_video, str(video_path), output_dir_structure["frames"]))
-
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"An error occurred: {e}")
+def make_classification_eval_transform(
+    *,
+    resize_size: int = 256,
+    interpolation=transforms.InterpolationMode.BICUBIC,
+    crop_size: int = 224,
+    mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
+    std: Sequence[float] = IMAGENET_DEFAULT_STD,
+) -> transforms.Compose:
+    """Create a composite transform for evaluation with classification models."""
+    transforms_list = [
+        transforms.Resize(resize_size, interpolation=interpolation),
+        transforms.CenterCrop(crop_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ]
+    return transforms.Compose(transforms_list)
 
 
-@torch.no_grad()
-def extract_features(model, data_loader, use_cuda=True, multiscale=False):
+def setup_logger(level=logging.DEBUG):
     """
-    Extract features from images using the provided model.
+    Set up a logger with color support for debug level messages.
 
     Args:
-        model: The Vision Transformer model.
-        data_loader: DataLoader for the dataset.
-        use_cuda: Whether to use CUDA.
-        multiscale: Whether to infer from multiple scales of the input images.
-
-    Returns:
-        A tensor containing extracted features for all images in the dataset.
+        level: The logging level, defaults to logging.DEBUG.
     """
-    if use_cuda:
-        model.cuda()
+    logger = logging.getLogger("FeatureExtractionLogger")
+    logger.setLevel(level)
 
-    model.eval()
-    features = []
+    # Define log format with colors
+    log_format = "%(log_color)s%(levelname)-8s%(reset)s - %(log_color)s%(message)s"
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(colorlog.ColoredFormatter(log_format))
 
-    for batch_idx, (samples, indices, paths, original_sizes) in enumerate(data_loader, start=1):
-        if use_cuda:
-            samples = samples.cuda(non_blocking=True)
+    logger.addHandler(handler)
 
-        if multiscale:
-            feats = utils.multi_scale(samples, model)
-        else:
-            feats = model(samples).clone()
+    return logger
 
-        features.append(feats.cpu())
 
-    return torch.cat(features, dim=0)
+def setup_transforms():
+    """
+    Setup the image transformations.
+    """
+    return transforms.Compose([
+        transforms.Resize(256),  # Resize the image to 256x256 pixels
+        transforms.CenterCrop(224),  # Crop the center 224x224 pixels
+        transforms.ToTensor(),  # Convert to PyTorch Tensor
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # Normalize with ImageNet mean and std
+    ])
 
-def load_model(arch, patch_size, pretrained_weights, checkpoint_key=None):
-    # Build model
-    model = vits.__dict__[arch](patch_size=patch_size, num_classes=0)
-    for p in model.parameters():
-        p.requires_grad = False
-    model.eval()
-    model.to(DEVICE)
 
-    if os.path.isfile(pretrained_weights):
-        state_dict = torch.load(pretrained_weights, map_location="cpu")
-        if checkpoint_key is not None and checkpoint_key in state_dict:
-            print(f"Taking key {checkpoint_key} from provided checkpoint dict")
-            state_dict = state_dict[checkpoint_key]
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}  # Adjust if needed
-        msg = model.load_state_dict(state_dict, strict=False)
-        print(f"Pretrained weights found at {pretrained_weights} and loaded with msg: {msg}")
-    else:
-        print("Please use the `--pretrained_weights` argument to indicate the path of the checkpoint to evaluate.")
-        url = None
-        if arch == "vit_small" and patch_size == 16:
-            url = "dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth"
-        elif arch == "vit_small" and patch_size == 8:
-            url = "dino_deitsmall8_300ep_pretrain/dino_deitsmall8_300ep_pretrain.pth"
-        elif arch == "vit_base" and patch_size == 16:
-            url = "dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
-        elif arch == "vit_base" and patch_size == 8:
-            url = "dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth"
-        if url is not None:
-            print("Loading reference pretrained DINO weights.")
-            state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)
-            model.load_state_dict(state_dict, strict=True)
-        else:
-            print("No reference weights available for this model configuration. Using random weights.")
 
-    return model
+def create_output_dirs(video_path, save_raw_features, save_attentions, save_pca):
+    """
+    Create output directories for raw features, attentions, and PCA features.
+    """
+    base_dir = Path(video_path).parent / "dinov2_out"
+    paths = {}
+    if save_raw_features:
+        paths['raw_features'] = base_dir / "raw_features"
+    if save_attentions:
+        paths['attentions'] = base_dir / "attentions"
+    if save_pca:
+        paths['pca_features'] = base_dir / "pca_features"
 
-def main(base_dir, role, output_base_dir, model, transform, batch_size=64, patch_size=8):
-    model, autocast_dtype = setup_and_build_model(args)
-    prepare_role_datasets(base_dir, role, output_base_dir)
-    session_dirs = list(Path(output_base_dir).glob(f"*/{role}/frames"))
+    for path in paths.values():
+        os.makedirs(path, exist_ok=True)
 
-    for session_dir in session_dirs:
-        dataset = CustomDataset(str(session_dir), transform=transform)
-        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-        #save_attention_maps(model, data_loader,output_dir=session_dir.parent, use_cuda=DEVICE.type == 'cuda', patch_size=patch_size)
-        extract_attention_maps_and_save_as_video(model, data_loader, session_dir.parent,role, use_cuda=True, patch_size=8,
-                                             threshold=0.6, fps=25, video_format='mp4')
-        #session_features = extract_features_and_save_attention_maps(model, data_loader,output_dir=session_dir.parent/"attention_maps", use_cuda=DEVICE.type == 'cuda', patch_size=patch_size)
-        #features_path = os.path.join(session_dir.parent, "extractions", "features.pt")
-        #torch.save(session_features, features_path)
+    return paths
 
+
+
+def extract_features_from_frame(frame, model, transform):
+    """
+    Extract features from a single frame using the specified DINOv2 model and visualize
+    the original and PCA-transformed image side by side.
+
+    Args:
+        frame: The video frame as a numpy array.
+        model: The DINOv2 model for feature extraction.
+        transform: The transformation to apply to the frame before feature extraction.
+        logger: Logger for debug messages.
+    """
+    original_image = Image.fromarray(frame).convert("RGB")
+    image = transform(original_image)
+    image_tensor = image.unsqueeze(0).to(DEVICE)
+
+    # Extract features
+    with torch.no_grad():
+        inference = model.forward_features(image_tensor)
+        features = inference['x_norm_patchtokens'].detach().cpu().numpy()[0]
+
+    logger.debug(f"Extracted features shape: {features.shape}")
+
+    # if save_pca or save_attentions:
+    #     #Apply PCA to reduce to 3 components (for RGB channels)
+    #     pca = PCA(n_components=3)
+    #     pca.fit(features)
+    #     pca_features = pca.transform(features)
+    #
+    #
+    #     pca_features = (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())
+    #     pca_features = pca_features * 255
+    #     pca_image = pca_features.reshape(16, 16, 3).astype(np.uint8)
+    #     pca_image_re= cv2.resize(pca_image, (width, height), interpolation=cv2.INTER_LINEAR)
+    #     # Prepare subplot
+    #     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    #
+    #     # Visualize the original image
+    #     ax[0].imshow(original_image)
+    #     ax[0].set_title("Original Image")
+    #     ax[0].axis('off')
+    #
+    #     ax[1].imshow(pca_image_re)
+    #     ax[1].set_title("PCA Image")
+    #     ax[1].axis('off')
+    #
+    #     plt.show()
+
+    return features
+
+def extract_features_from_video(video_path, model, transform, logger, save_raw_features=True, save_attentions=True, save_pca=True, n_pca_components=3):
+    """
+    Extract features from each frame and save them along with optional PCA and attention images.
+    """
+    video_path = Path(video_path)
+    output_dirs = create_output_dirs(video_path, save_raw_features, save_attentions, save_pca)
+
+    vidcap = cv2.VideoCapture(str(video_path))
+    width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    success, frame = vidcap.read()
+    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    features_list = []
+    frame_processed = 0
+
+    with tqdm(total=min(frame_count, 100), desc="Extracting features", unit="frame") as pbar:
+        while success and frame_processed < 100:
+            # Convert the frame from BGR (OpenCV default) to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Extract features from the RGB frame
+            features = extract_features_from_frame(frame_rgb, model, transform,width, height, logger, save_attentions=True, save_pca=True)
+            features_list.append(features)
+
+            # Optional: Save attention images (adjust feature extraction to include attention maps)
+
+            success, frame = vidcap.read()
+            pbar.update(1)
+            frame_processed += 1
+
+
+    # Save raw features if requested
+    if save_raw_features:
+        np.save(str(output_dirs['raw_features'] / f"{video_path.stem}_features.npy"), features_list)
+
+    logger.info(f"Processed {video_path.name}")
+
+
+def frame_to_pca(frame_features,  output_shape, n_components=3,):
+    """
+    Apply PCA to the features of a single frame and resize to match the original video dimensions.
+    """
+    pca = PCA(n_components=n_components)
+    pca_features = pca.fit_transform(frame_features)
+    pca_features_normalized = np.clip(
+        (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min()) * 255, 0, 255)
+    pca_image = pca_features_normalized.reshape((16, 16, 3)).astype(np.uint8)
+
+    # Resize the PCA image to match the original video dimensions
+    pca_image_resized = cv2.resize(pca_image, output_shape, interpolation=cv2.INTER_LINEAR)
+    return pca_image_resized
+
+
+def video_to_pca_video(video_path, model, transform, output_video_path, fps=25):
+    vidcap = cv2.VideoCapture(str(video_path))
+    success, frame = vidcap.read()
+
+    # Obtain original video dimensions
+    original_width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    output_shape = (original_width, original_height)
+
+    # Initialize video writer with original video dimensions
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, output_shape)
+
+    while success:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        features = extract_features_from_frame(frame_rgb, model, transform)
+
+        # Resize the PCA-transformed frame to match the original video dimensions
+        pca_frame = frame_to_pca(features, n_components=3, output_shape=output_shape)
+        out.write(pca_frame)
+
+        success, frame = vidcap.read()
+
+    out.release()
+    print(f"PCA video saved to {output_video_path}")
 
 if __name__ == "__main__":
-    # Example usage
-    base_dir = "data"
-    role = "infant"
-    output_base_dir = "data/output"
+    video_path = "D:/GitHub/dino/data/NP001/infant.video.mp4"
+    output_video_path = "D:/GitHub/dino/data/NP001/direct.pca.mp4"
+    logger = setup_logger(level=logging.INFO)  # Setup colored logger
+    model = hubconf.dinov2_vitl14().to(DEVICE)  # Load the DINOv2 model
+    #transform = make_classification_eval_transform()  # Setup transformations
+    transform = setup_transforms()
 
-    arch = "vit_small"
-    patch_size = 8
-    pretrained_weights = "models/dino_deitsmall8_pretrain.pth"
-    checkpoint_key = None
-    resize = None
-
-    if resize is not None:
-        transform = pth_transforms.Compose(
-            [
-                pth_transforms.ToTensor(),
-                pth_transforms.Resize(resize),
-                pth_transforms.Normalize(
-                    (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-                ),
-            ]
-        )
-    else:
-        transform = pth_transforms.Compose(
-            [
-                pth_transforms.ToTensor(),
-                pth_transforms.Normalize(
-                    (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-                ),
-            ]
-        )
-
-    # Initialize your model here
-    model = load_model(arch, patch_size, pretrained_weights, checkpoint_key)
-
-    main(base_dir, role, output_base_dir, model, transform,patch_size=patch_size)
+    # # Extract features from video
+    # extract_features_from_video(video_path, model, transform, logger)
+    #video_to_pca_video(video_path, model, transform, output_video_path)
+    video_to_pca_video(video_path, model, transform, output_video_path)
