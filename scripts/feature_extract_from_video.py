@@ -1,233 +1,109 @@
-from torchvision import transforms
-from typing import Sequence
-from PIL import Image
-import hubconf
+import argparse
+import cv2
 import logging
+import numpy as np
+import os
+from pathlib import Path
+from PIL import Image
+import torch
+from torchvision import transforms
+from sklearn.decomposition import PCA
+import hubconf
 import colorlog
 from tqdm import tqdm
-import cv2
-import numpy as np
-from pathlib import Path
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-import torch
-import os
-
-DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-# Use timm's names for ImageNet default mean and standard deviation
-IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
-
-def make_classification_eval_transform(
-    *,
-    resize_size: int = 256,
-    interpolation=transforms.InterpolationMode.BICUBIC,
-    crop_size: int = 224,
-    mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
-    std: Sequence[float] = IMAGENET_DEFAULT_STD,
-) -> transforms.Compose:
-    """Create a composite transform for evaluation with classification models."""
-    transforms_list = [
-        transforms.Resize(resize_size, interpolation=interpolation),
-        transforms.CenterCrop(crop_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ]
-    return transforms.Compose(transforms_list)
-
 
 def setup_logger(level=logging.DEBUG):
-    """
-    Set up a logger with color support for debug level messages.
-
-    Args:
-        level: The logging level, defaults to logging.DEBUG.
-    """
     logger = logging.getLogger("FeatureExtractionLogger")
     logger.setLevel(level)
-
-    # Define log format with colors
     log_format = "%(log_color)s%(levelname)-8s%(reset)s - %(log_color)s%(message)s"
     handler = colorlog.StreamHandler()
     handler.setFormatter(colorlog.ColoredFormatter(log_format))
-
     logger.addHandler(handler)
-
     return logger
 
 
 def setup_transforms():
-    """
-    Setup the image transformations.
-    """
     return transforms.Compose([
-        transforms.Resize(256),  # Resize the image to 256x256 pixels
-        transforms.CenterCrop(224),  # Crop the center 224x224 pixels
-        transforms.ToTensor(),  # Convert to PyTorch Tensor
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # Normalize with ImageNet mean and std
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
-
-def create_output_dirs(video_path, save_raw_features, save_attentions, save_pca):
-    """
-    Create output directories for raw features, attentions, and PCA features.
-    """
-    base_dir = Path(video_path).parent / "dinov2_out"
-    paths = {}
-    if save_raw_features:
-        paths['raw_features'] = base_dir / "raw_features"
-    if save_attentions:
-        paths['attentions'] = base_dir / "attentions"
-    if save_pca:
-        paths['pca_features'] = base_dir / "pca_features"
-
-    for path in paths.values():
-        os.makedirs(path, exist_ok=True)
-
-    return paths
-
-
-
-def extract_features_from_frame(frame, model, transform):
-    """
-    Extract features from a single frame using the specified DINOv2 model and visualize
-    the original and PCA-transformed image side by side.
-
-    Args:
-        frame: The video frame as a numpy array.
-        model: The DINOv2 model for feature extraction.
-        transform: The transformation to apply to the frame before feature extraction.
-        logger: Logger for debug messages.
-    """
+def extract_features_from_frame(frame, model, transform, device):
     original_image = Image.fromarray(frame).convert("RGB")
     image = transform(original_image)
-    image_tensor = image.unsqueeze(0).to(DEVICE)
-
-    # Extract features
+    image_tensor = image.unsqueeze(0).to(device)
     with torch.no_grad():
         inference = model.forward_features(image_tensor)
         features = inference['x_norm_patchtokens'].detach().cpu().numpy()[0]
-
-    logger.debug(f"Extracted features shape: {features.shape}")
-
-    # if save_pca or save_attentions:
-    #     #Apply PCA to reduce to 3 components (for RGB channels)
-    #     pca = PCA(n_components=3)
-    #     pca.fit(features)
-    #     pca_features = pca.transform(features)
-    #
-    #
-    #     pca_features = (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())
-    #     pca_features = pca_features * 255
-    #     pca_image = pca_features.reshape(16, 16, 3).astype(np.uint8)
-    #     pca_image_re= cv2.resize(pca_image, (width, height), interpolation=cv2.INTER_LINEAR)
-    #     # Prepare subplot
-    #     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-    #
-    #     # Visualize the original image
-    #     ax[0].imshow(original_image)
-    #     ax[0].set_title("Original Image")
-    #     ax[0].axis('off')
-    #
-    #     ax[1].imshow(pca_image_re)
-    #     ax[1].set_title("PCA Image")
-    #     ax[1].axis('off')
-    #
-    #     plt.show()
-
     return features
 
-def extract_features_from_video(video_path, model, transform, logger, save_raw_features=True, save_attentions=True, save_pca=True, n_pca_components=3):
-    """
-    Extract features from each frame and save them along with optional PCA and attention images.
-    """
-    video_path = Path(video_path)
-    output_dirs = create_output_dirs(video_path, save_raw_features, save_attentions, save_pca)
 
-    vidcap = cv2.VideoCapture(str(video_path))
-    width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+def frame_feature_to_pca(frame_features, output_shape=None, n_components=3, return_pca_image=False):
+    pca = PCA(n_components=n_components)
+    pca_features = pca.fit_transform(frame_features)
+    pca_image_resized = None
+    if return_pca_image:
+        pca_features_normalized = np.clip(
+            ((pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())) * 255, 0, 255)
+        pca_image = pca_features_normalized.reshape((16, 16, 3)).astype(np.uint8)
+        pca_image_resized = cv2.resize(pca_image, output_shape, interpolation=cv2.INTER_LINEAR)
+    return pca_features, pca_image_resized
+
+
+def process_video(args, logger, device):
+    model = hubconf.__dict__[f"dinov2_vit{args.model_type}14"]().to(device)
+    transform = setup_transforms()
+    vidcap = cv2.VideoCapture(args.video_path)
     success, frame = vidcap.read()
-    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    raw_feature_list, pca_features_list = [], []
 
-    features_list = []
-    frame_processed = 0
-
-    with tqdm(total=min(frame_count, 100), desc="Extracting features", unit="frame") as pbar:
-        while success and frame_processed < 100:
-            # Convert the frame from BGR (OpenCV default) to RGB
+    # Initialize tqdm progress bar for the main processing loop
+    with tqdm(total=total_frames, desc="Processing video frames") as pbar:
+        while success:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            features = extract_features_from_frame(frame_rgb, model, transform, device)
+            pca_features, _ = frame_feature_to_pca(features, n_components=args.pca_components, return_pca_image=False)  # Video writing part removed
 
-            # Extract features from the RGB frame
-            features = extract_features_from_frame(frame_rgb, model, transform,width, height, logger, save_attentions=True, save_pca=True)
-            features_list.append(features)
-
-            # Optional: Save attention images (adjust feature extraction to include attention maps)
+            if args.save_raw_features:
+                raw_feature_list.append(features)
+            if args.save_pca_features:
+                pca_features_list.append(pca_features)
 
             success, frame = vidcap.read()
             pbar.update(1)
-            frame_processed += 1
+
+    vidcap.release()
+
+    if args.save_raw_features:
+        np.save(f"{Path(args.video_path)}.dinov2_vit{args.model_type}.stream.npy", np.array(raw_feature_list))
+        logger.info(f"Saved raw features at {Path(args.video_path).stem}.dinov2_vit{args.model_type}.stream.npy")
+
+    if args.save_pca_features:
+        np.save(f"{Path(args.video_path)}.dinov2_vit{args.model_type}_{args.pca_components}pca.stream.npy",
+                np.array(pca_features_list))
+        logger.info(f"Saved PCA features at {Path(args.video_path).stem}.dinov2_vit{args.model_type}_{args.pca_components}pca.stream.npy")
 
 
-    # Save raw features if requested
-    if save_raw_features:
-        np.save(str(output_dirs['raw_features'] / f"{video_path.stem}_features.npy"), features_list)
+def main():
+    parser = argparse.ArgumentParser(description="Video feature extraction with DINOv2.")
+    parser.add_argument("--video_path", type=str, required=True, help="Path to the input video.")
+    parser.add_argument("--model_type", type=str, choices=["s", "m", "l", "g"], default="l",
+                        help="Model type to use (s, m, l, g).")
+    parser.add_argument("--save_raw_features", action="store_true", default=True, help="Save raw features.")
+    parser.add_argument("--save_pca_features", action="store_true", default=True, help="Save PCA features.")
+    parser.add_argument("--save_pca_video", action="store_true", default=False, help="Save PCA visualization video.")
+    parser.add_argument("--pca_components", type=int, default=3, help="Number of PCA components.")
 
-    logger.info(f"Processed {video_path.name}")
+    args = parser.parse_args()
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger = setup_logger(level=logging.INFO)
+    process_video(args, logger, device)
 
-def frame_to_pca(frame_features,  output_shape, n_components=3,):
-    """
-    Apply PCA to the features of a single frame and resize to match the original video dimensions.
-    """
-    pca = PCA(n_components=n_components)
-    pca_features = pca.fit_transform(frame_features)
-    pca_features_normalized = np.clip(
-        (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min()) * 255, 0, 255)
-    pca_image = pca_features_normalized.reshape((16, 16, 3)).astype(np.uint8)
-
-    # Resize the PCA image to match the original video dimensions
-    pca_image_resized = cv2.resize(pca_image, output_shape, interpolation=cv2.INTER_LINEAR)
-    return pca_image_resized
-
-
-def video_to_pca_video(video_path, model, transform, output_video_path, fps=25):
-    vidcap = cv2.VideoCapture(str(video_path))
-    success, frame = vidcap.read()
-
-    # Obtain original video dimensions
-    original_width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    output_shape = (original_width, original_height)
-
-    # Initialize video writer with original video dimensions
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, output_shape)
-
-    while success:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        features = extract_features_from_frame(frame_rgb, model, transform)
-
-        # Resize the PCA-transformed frame to match the original video dimensions
-        pca_frame = frame_to_pca(features, n_components=3, output_shape=output_shape)
-        out.write(pca_frame)
-
-        success, frame = vidcap.read()
-
-    out.release()
-    print(f"PCA video saved to {output_video_path}")
 
 if __name__ == "__main__":
-    video_path = "D:/GitHub/dino/data/NP001/infant.video.mp4"
-    output_video_path = "D:/GitHub/dino/data/NP001/direct.pca.mp4"
-    logger = setup_logger(level=logging.INFO)  # Setup colored logger
-    model = hubconf.dinov2_vitl14().to(DEVICE)  # Load the DINOv2 model
-    #transform = make_classification_eval_transform()  # Setup transformations
-    transform = setup_transforms()
-
-    # # Extract features from video
-    # extract_features_from_video(video_path, model, transform, logger)
-    #video_to_pca_video(video_path, model, transform, output_video_path)
-    video_to_pca_video(video_path, model, transform, output_video_path)
+    main()
